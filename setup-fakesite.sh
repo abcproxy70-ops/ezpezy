@@ -3,7 +3,7 @@ set -e
 
 # ============================================
 #  Быстрая настройка nginx + SSL + фейксайт
-#  Для использования с VLESS Reality
+#  Для использования с VLESS Reality (selfSNI)
 #  Шаблон: learning-zone/website-templates
 # ============================================
 
@@ -25,30 +25,22 @@ if [[ -z "$DOMAIN" ]]; then
     exit 1
 fi
 
-# --- Выбор порта для Xray ---
+# --- Выбор порта для nginx SSL ---
 echo ""
-echo -e "${YELLOW}На каком порту будет работать Xray (Reality)?${NC}"
-echo "  1) 443  — Xray на 443, nginx только на 80 (без SSL)"
-echo "  2) 8443 — Xray на 8443, nginx на 80 + 443 (с SSL, selfSNI)"
+echo -e "${YELLOW}На каком порту поднять nginx с SSL (фейксайт)?${NC}"
+echo -e "Этот порт будет указан как dest в Reality."
+echo -e "Не указывайте порт, который уже занят Xray!"
 echo ""
-read -rp "Выберите вариант [1/2]: " PORT_CHOICE
+read -rp "Порт для nginx SSL [443]: " NGINX_SSL_PORT
+NGINX_SSL_PORT=${NGINX_SSL_PORT:-443}
 
-case "$PORT_CHOICE" in
-    1)
-        XRAY_PORT=443
-        NGINX_SSL=false
-        ;;
-    2)
-        XRAY_PORT=8443
-        NGINX_SSL=true
-        ;;
-    *)
-        echo -e "${RED}Неверный выбор!${NC}"
-        exit 1
-        ;;
-esac
+# Валидация порта
+if ! [[ "$NGINX_SSL_PORT" =~ ^[0-9]+$ ]] || [[ "$NGINX_SSL_PORT" -lt 1 || "$NGINX_SSL_PORT" -gt 65535 ]]; then
+    echo -e "${RED}Некорректный порт!${NC}"
+    exit 1
+fi
 
-echo -e "${GREEN}Xray будет на порту ${XRAY_PORT}${NC}"
+echo -e "${GREEN}nginx SSL будет на порту ${NGINX_SSL_PORT}${NC}"
 
 # --- Проверка DNS ---
 echo -e "\n${YELLOW}Проверяю DNS для ${DOMAIN}...${NC}"
@@ -66,19 +58,17 @@ fi
 echo -e "${GREEN}DNS ок.${NC}"
 
 # --- Проверка портов ---
-if [[ "$NGINX_SSL" == true ]]; then
-    if ss -tuln | grep -q ":443 "; then
-        echo -e "${RED}Порт 443 занят! Освободите порт и запустите снова.${NC}"
-        exit 1
-    fi
-fi
-
 if ss -tuln | grep -q ":80 "; then
     echo -e "${RED}Порт 80 занят! Освободите порт и запустите снова.${NC}"
     exit 1
 fi
 
-echo -e "${GREEN}Нужные порты свободны.${NC}"
+if ss -tuln | grep -q ":${NGINX_SSL_PORT} "; then
+    echo -e "${RED}Порт ${NGINX_SSL_PORT} занят! Выберите другой порт.${NC}"
+    exit 1
+fi
+
+echo -e "${GREEN}Порты 80 и ${NGINX_SSL_PORT} свободны.${NC}"
 
 # --- Установка пакетов ---
 echo -e "\n${YELLOW}Устанавливаю nginx, certbot, git...${NC}"
@@ -122,9 +112,7 @@ echo -e "\n${YELLOW}Настраиваю nginx...${NC}"
 rm -f /etc/nginx/sites-enabled/*
 rm -f /etc/nginx/sites-available/default
 
-if [[ "$NGINX_SSL" == true ]]; then
-    # Вариант 2: nginx на 80 + 443, Xray на 8443
-    cat > /etc/nginx/sites-enabled/"$DOMAIN" << NGINX
+cat > /etc/nginx/sites-enabled/"$DOMAIN" << NGINX
 server {
     listen 80;
     server_name ${DOMAIN};
@@ -132,7 +120,7 @@ server {
 }
 
 server {
-    listen 443 ssl http2;
+    listen ${NGINX_SSL_PORT} ssl http2;
     server_name ${DOMAIN};
 
     ssl_certificate /etc/letsencrypt/live/${DOMAIN}/fullchain.pem;
@@ -146,19 +134,12 @@ server {
     }
 }
 NGINX
-else
-    # Вариант 1: nginx только на 80, Xray на 443
-    cat > /etc/nginx/sites-enabled/"$DOMAIN" << NGINX
-server {
-    listen 80;
-    server_name ${DOMAIN};
 
-    location / {
-        root /var/www/html;
-        index index.html;
-    }
-}
-NGINX
+# --- Открытие порта в UFW (если активен) ---
+if command -v ufw &>/dev/null && ufw status | grep -q "active"; then
+    ufw allow 80/tcp > /dev/null 2>&1
+    ufw allow ${NGINX_SSL_PORT}/tcp > /dev/null 2>&1
+    echo -e "${GREEN}Порты 80 и ${NGINX_SSL_PORT} открыты в UFW.${NC}"
 fi
 
 # --- Проверка и запуск ---
@@ -172,29 +153,15 @@ echo -e "${GREEN}========================================${NC}"
 echo -e "${GREEN} Готово!${NC}"
 echo -e "${GREEN}========================================${NC}"
 echo ""
-
-if [[ "$NGINX_SSL" == true ]]; then
-    echo -e "Сайт:         https://${DOMAIN}"
-else
-    echo -e "Сайт:         http://${DOMAIN}"
-fi
-
+echo -e "Сайт:         https://${DOMAIN}$([ "$NGINX_SSL_PORT" != "443" ] && echo ":${NGINX_SSL_PORT}")"
 echo -e "Сертификат:   /etc/letsencrypt/live/${DOMAIN}/fullchain.pem"
 echo -e "Ключ:         /etc/letsencrypt/live/${DOMAIN}/privkey.pem"
 echo ""
 echo -e "${YELLOW}Настройки для Remnawave (Reality inbound):${NC}"
-echo -e "  port:        ${XRAY_PORT}"
-echo -e "  dest:        ${DOMAIN}:443"
+echo -e "  dest:        ${DOMAIN}:${NGINX_SSL_PORT}"
 echo -e "  serverNames: ${DOMAIN}"
 echo ""
-echo -e "${GREEN}Порт 80  — nginx (фейксайт)${NC}"
-
-if [[ "$NGINX_SSL" == true ]]; then
-    echo -e "${GREEN}Порт 443 — nginx (фейксайт SSL)${NC}"
-    echo -e "${GREEN}Порт 8443 — Xray (Reality)${NC}"
-else
-    echo -e "${GREEN}Порт 443 — Xray (Reality)${NC}"
-fi
-
+echo -e "${GREEN}Порт 80            — nginx (редирект)${NC}"
+echo -e "${GREEN}Порт ${NGINX_SSL_PORT}          — nginx (фейксайт SSL)${NC}"
 echo ""
 echo -e "Скрипт завершён."
