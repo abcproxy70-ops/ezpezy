@@ -2,7 +2,7 @@
 set -e
 
 # ============================================
-#  Быстрая настройка nginx + SSL + фейксайт
+#  Быстрая настройка Caddy + фейксайт
 #  Status page (maintenance) для VLESS Reality
 # ============================================
 
@@ -12,7 +12,7 @@ YELLOW='\033[1;33m'
 NC='\033[0m'
 
 echo -e "${GREEN}========================================${NC}"
-echo -e "${GREEN} Настройка nginx + SSL + status page${NC}"
+echo -e "${GREEN} Настройка Caddy + status page${NC}"
 echo -e "${GREEN}========================================${NC}"
 echo ""
 
@@ -26,13 +26,14 @@ fi
 
 # --- Выбор порта ---
 echo ""
-echo -e "${YELLOW}На каком порту поднять nginx с SSL (фейксайт)?${NC}"
+echo -e "${YELLOW}На каком порту поднять Caddy с SSL (фейксайт)?${NC}"
 echo -e "Этот порт будет указан как dest в Reality."
+echo -e "Не указывайте порт, который уже занят Xray!"
 echo ""
-read -rp "Порт для nginx SSL [443]: " NGINX_SSL_PORT
-NGINX_SSL_PORT=${NGINX_SSL_PORT:-443}
+read -rp "Порт для Caddy SSL [443]: " CADDY_SSL_PORT
+CADDY_SSL_PORT=${CADDY_SSL_PORT:-443}
 
-if ! [[ "$NGINX_SSL_PORT" =~ ^[0-9]+$ ]] || [[ "$NGINX_SSL_PORT" -lt 1 || "$NGINX_SSL_PORT" -gt 65535 ]]; then
+if ! [[ "$CADDY_SSL_PORT" =~ ^[0-9]+$ ]] || [[ "$CADDY_SSL_PORT" -lt 1 || "$CADDY_SSL_PORT" -gt 65535 ]]; then
     echo -e "${RED}Некорректный порт!${NC}"
     exit 1
 fi
@@ -51,28 +52,39 @@ fi
 echo -e "${GREEN}DNS ок.${NC}"
 
 # --- Порты ---
+# 80 нужен для ACME HTTP-01 challenge
 if ss -tuln | grep -q ":80 "; then
-    echo -e "${RED}Порт 80 занят!${NC}"
+    echo -e "${RED}Порт 80 занят! Caddy нужен 80 для получения SSL.${NC}"
     exit 1
 fi
-if ss -tuln | grep -q ":${NGINX_SSL_PORT} "; then
-    echo -e "${RED}Порт ${NGINX_SSL_PORT} занят!${NC}"
+if ss -tuln | grep -q ":${CADDY_SSL_PORT} "; then
+    echo -e "${RED}Порт ${CADDY_SSL_PORT} занят!${NC}"
     exit 1
 fi
 echo -e "${GREEN}Порты свободны.${NC}"
 
-# --- Установка ---
-echo -e "\n${YELLOW}Устанавливаю nginx, certbot...${NC}"
-apt update -qq
-apt install -y -qq nginx certbot python3-certbot-nginx > /dev/null 2>&1
-systemctl stop nginx 2>/dev/null || true
-echo -e "${GREEN}Установлено.${NC}"
+# --- Удаляем nginx если стоит (конфликт за порты) ---
+if systemctl is-active --quiet nginx 2>/dev/null; then
+    echo -e "${YELLOW}Останавливаю nginx (будет конфликт с Caddy)...${NC}"
+    systemctl stop nginx
+    systemctl disable nginx 2>/dev/null || true
+fi
 
-# --- SSL ---
-echo -e "\n${YELLOW}Получаю SSL сертификат...${NC}"
-certbot certonly --standalone --non-interactive --agree-tos \
-    -m "admin@${DOMAIN}" -d "$DOMAIN"
-echo -e "${GREEN}Сертификат получен.${NC}"
+# --- Установка Caddy ---
+echo -e "\n${YELLOW}Устанавливаю Caddy...${NC}"
+apt update -qq
+apt install -y -qq debian-keyring debian-archive-keyring apt-transport-https curl > /dev/null 2>&1
+
+# Официальный репозиторий Caddy
+if [[ ! -f /etc/apt/sources.list.d/caddy-stable.list ]]; then
+    curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' | gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg 2>/dev/null
+    curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' | tee /etc/apt/sources.list.d/caddy-stable.list > /dev/null
+    apt update -qq
+fi
+
+apt install -y -qq caddy > /dev/null 2>&1
+systemctl stop caddy 2>/dev/null || true
+echo -e "${GREEN}Caddy установлен.${NC}"
 
 # --- Извлекаем имя из домена для брендинга ---
 DOMAIN_NAME=$(echo "$DOMAIN" | awk -F. '{print $(NF-1)}')
@@ -80,11 +92,15 @@ DOMAIN_TITLE=$(echo "$DOMAIN_NAME" | sed 's/.*/\u&/')
 CURRENT_YEAR=$(date +"%Y")
 CURRENT_DATE=$(date -u +"%Y-%m-%d")
 
-# --- Генерация status page ---
-echo -e "\n${YELLOW}Создаю status page...${NC}"
-rm -rf /var/www/html/*
+# --- Каталог сайта ---
+WEB_ROOT="/var/www/html"
+mkdir -p "$WEB_ROOT"
+rm -rf "$WEB_ROOT"/*
 
-cat > /var/www/html/index.html << HTML
+# --- Status page ---
+echo -e "\n${YELLOW}Создаю status page...${NC}"
+
+cat > "$WEB_ROOT/index.html" << HTML
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -258,7 +274,7 @@ HTML
 
 # --- Заглушки для /privacy и /terms ---
 for page in privacy terms; do
-    cat > /var/www/html/${page}.html << EOF
+    cat > "$WEB_ROOT/${page}.html" << EOF
 <!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">
 <title>${page^} — ${DOMAIN_TITLE} Cloud</title>
 <style>body{font-family:-apple-system,sans-serif;background:#0f1419;color:#e6e6e6;max-width:720px;margin:80px auto;padding:24px;line-height:1.6}a{color:#60a5fa}</style>
@@ -269,7 +285,7 @@ EOF
 done
 
 # --- robots.txt ---
-cat > /var/www/html/robots.txt << EOF
+cat > "$WEB_ROOT/robots.txt" << EOF
 User-agent: *
 Disallow: /admin
 Disallow: /api/internal
@@ -278,7 +294,7 @@ Sitemap: https://${DOMAIN}/sitemap.xml
 EOF
 
 # --- sitemap.xml ---
-cat > /var/www/html/sitemap.xml << EOF
+cat > "$WEB_ROOT/sitemap.xml" << EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
   <url><loc>https://${DOMAIN}/</loc><lastmod>${CURRENT_DATE}</lastmod><priority>1.0</priority></url>
@@ -287,74 +303,82 @@ cat > /var/www/html/sitemap.xml << EOF
 </urlset>
 EOF
 
-# --- Health endpoint (JSON) ---
-mkdir -p /var/www/html/api
-cat > /var/www/html/api/health.json << EOF
+# --- Health endpoint ---
+mkdir -p "$WEB_ROOT/api"
+cat > "$WEB_ROOT/api/health" << EOF
 {"status":"maintenance","service":"${DOMAIN_NAME}-api","version":"1.0.0","message":"Scheduled maintenance in progress"}
 EOF
 
+# Права для Caddy
+chown -R caddy:caddy "$WEB_ROOT" 2>/dev/null || true
+
 echo -e "${GREEN}Status page готов.${NC}"
 
-# --- nginx config ---
-echo -e "\n${YELLOW}Настраиваю nginx...${NC}"
-rm -f /etc/nginx/sites-enabled/*
-rm -f /etc/nginx/sites-available/default
+# --- Caddyfile ---
+echo -e "\n${YELLOW}Настраиваю Caddy...${NC}"
 
-cat > /etc/nginx/sites-enabled/"$DOMAIN" << NGINX
-server {
-    listen 80;
-    server_name ${DOMAIN};
-    return 301 https://\$host\$request_uri;
+# Если порт не 443 — отключаем авто-редирект и используем TLS-ALPN-01 не получится,
+# поэтому для нестандартного порта используем HTTP-challenge через 80
+if [[ "$CADDY_SSL_PORT" == "443" ]]; then
+    SITE_ADDR="${DOMAIN}"
+else
+    SITE_ADDR="${DOMAIN}:${CADDY_SSL_PORT}"
+fi
+
+cat > /etc/caddy/Caddyfile << CADDY
+{
+    # Email для Let's Encrypt
+    email admin@${DOMAIN}
+    # HTTP-challenge через 80 порт (работает и для нестандартных SSL-портов)
+    http_port 80
+    https_port ${CADDY_SSL_PORT}
 }
 
-server {
-    listen ${NGINX_SSL_PORT} ssl http2;
-    server_name ${DOMAIN};
+${SITE_ADDR} {
+    root * ${WEB_ROOT}
+    file_server
 
-    ssl_certificate /etc/letsencrypt/live/${DOMAIN}/fullchain.pem;
-    ssl_certificate_key /etc/letsencrypt/live/${DOMAIN}/privkey.pem;
-    ssl_protocols TLSv1.2 TLSv1.3;
-    ssl_prefer_server_ciphers on;
+    # Health endpoint отдаёт JSON
+    @health path /api/health
+    header @health Content-Type application/json
 
-    add_header X-Frame-Options "SAMEORIGIN" always;
-    add_header X-Content-Type-Options "nosniff" always;
-    add_header Referrer-Policy "strict-origin-when-cross-origin" always;
-
-    server_tokens off;
-
-    root /var/www/html;
-    index index.html;
-
-    location / {
-        try_files \$uri \$uri.html \$uri/ /index.html;
+    # Security headers (Caddy автоматом добавляет HSTS — не дублируем)
+    header {
+        X-Frame-Options SAMEORIGIN
+        X-Content-Type-Options nosniff
+        Referrer-Policy strict-origin-when-cross-origin
+        -Server
     }
 
-    location = /api/health {
-        default_type application/json;
-        alias /var/www/html/api/health.json;
-    }
+    # Кэш статики
+    @static path *.css *.js *.jpg *.jpeg *.png *.gif *.ico *.woff *.woff2 *.svg
+    header @static Cache-Control "public, max-age=2592000, immutable"
+
+    encode gzip zstd
 }
-NGINX
+CADDY
 
 # --- UFW ---
 if command -v ufw &>/dev/null && ufw status | grep -q "active"; then
     ufw allow 80/tcp > /dev/null 2>&1
-    ufw allow ${NGINX_SSL_PORT}/tcp > /dev/null 2>&1
+    ufw allow ${CADDY_SSL_PORT}/tcp > /dev/null 2>&1
+    echo -e "${GREEN}Порты 80 и ${CADDY_SSL_PORT} открыты в UFW.${NC}"
 fi
 
-# --- Запуск ---
-nginx -t
-systemctl start nginx
-systemctl enable nginx
+# --- Проверка конфига и запуск ---
+caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
+systemctl restart caddy
+systemctl enable caddy > /dev/null 2>&1
 
-# --- Auto-renew hook ---
-RENEW_HOOK="/etc/letsencrypt/renewal-hooks/deploy/reload-nginx.sh"
-mkdir -p "$(dirname "$RENEW_HOOK")"
-cat > "$RENEW_HOOK" << 'EOF'
-#!/bin/bash
-systemctl reload nginx
-EOF
-chmod +x "$RENEW_HOOK"
+# Ждём пока Caddy получит сертификат (несколько секунд)
+echo -e "\n${YELLOW}Жду получения SSL сертификата от Caddy...${NC}"
+for i in {1..30}; do
+    if curl -sk --max-time 3 "https://${DOMAIN}:${CADDY_SSL_PORT}" -o /dev/null 2>&1; then
+        echo -e "${GREEN}Сертификат получен.${NC}"
+        break
+    fi
+    sleep 2
+done
 
 # --- Результат ---
 echo ""
@@ -362,12 +386,18 @@ echo -e "${GREEN}========================================${NC}"
 echo -e "${GREEN} Готово!${NC}"
 echo -e "${GREEN}========================================${NC}"
 echo ""
-echo -e "Сайт:         https://${DOMAIN}$([ "$NGINX_SSL_PORT" != "443" ] && echo ":${NGINX_SSL_PORT}")"
-echo -e "Health:       https://${DOMAIN}/api/health"
-echo -e "Сертификат:   /etc/letsencrypt/live/${DOMAIN}/fullchain.pem"
+echo -e "Сайт:         https://${DOMAIN}$([ "$CADDY_SSL_PORT" != "443" ] && echo ":${CADDY_SSL_PORT}")"
+echo -e "Health:       https://${DOMAIN}$([ "$CADDY_SSL_PORT" != "443" ] && echo ":${CADDY_SSL_PORT}")/api/health"
+echo -e "Caddyfile:    /etc/caddy/Caddyfile"
+echo -e "Сертификаты:  /var/lib/caddy/.local/share/caddy/certificates/ (управляет Caddy сам)"
 echo ""
 echo -e "${YELLOW}Reality inbound:${NC}"
-echo -e "  dest:        ${DOMAIN}:${NGINX_SSL_PORT}"
+echo -e "  dest:        ${DOMAIN}:${CADDY_SSL_PORT}"
 echo -e "  serverNames: ${DOMAIN}"
+echo ""
+echo -e "${GREEN}Управление:${NC}"
+echo -e "  systemctl status caddy   — статус"
+echo -e "  systemctl reload caddy   — применить изменения Caddyfile"
+echo -e "  journalctl -u caddy -f   — логи"
 echo ""
 echo -e "Скрипт завершён."
